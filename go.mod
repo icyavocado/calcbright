@@ -1,3 +1,3 @@
-module github.com/yourorg/calculate-brightness
+module github.com/icyavocado/calcbright
 
 go 1.20

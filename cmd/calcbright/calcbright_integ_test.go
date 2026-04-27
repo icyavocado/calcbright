@@ -18,7 +18,7 @@ func TestCLIEndToEnd(t *testing.T) {
 	defer ts.Close()
 
 	// build binary (use module path so build works from this package)
-	if err := exec.Command("go", "build", "-o", "testcalc", "github.com/yourorg/calculate-brightness/cmd/calcbright").Run(); err != nil {
+	if err := exec.Command("go", "build", "-o", "testcalc", "github.com/icyavocado/calcbright/cmd/calcbright").Run(); err != nil {
 		t.Fatalf("build failed: %v", err)
 	}
 	defer os.Remove("testcalc")

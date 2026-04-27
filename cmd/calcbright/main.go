@@ -1,20 +1,21 @@
 package main
 
 import (
-    "context"
-    "encoding/csv"
-    "encoding/json"
-    "flag"
-    "fmt"
-    "math"
-    "os"
-    "os/exec"
-    "os/signal"
-    "strings"
-    "syscall"
-    "time"
+	"context"
+	"encoding/csv"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"math"
+	"os"
+	"os/exec"
+	"os/signal"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
 
-    "github.com/yourorg/calculate-brightness/brightness"
+	"github.com/icyavocado/calcbright/brightness"
 )
 
 // shellJoin joins args for display in dry-run. It does not attempt to escape fully; for human-readable output only.
@@ -45,158 +46,199 @@ func quoteShellArg(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }
 
-// runBrightness is the function used to actually apply brightness changes.
-// It is a variable so tests can override it.
+// cached resolved executable paths (resolved once to avoid repeated lookups).
+var (
+	resolveOnce               sync.Once
+	resolvedBrightnessctlPath string
+	resolvedSudoPath          string
+)
+
+// runBrightness is the function used to actually apply brightness changes. It is a
+// variable so tests can override it. For efficiency we resolve external binary
+// locations once and reuse them across calls.
 var runBrightness = func(pctInt int, device string, useSudo bool, dryRun bool) error {
-    args := []string{}
-    if device != "" {
-        args = append(args, "-d", device)
-    }
-    args = append(args, "set", fmt.Sprintf("%d%%", pctInt))
+	args := []string{}
+	if device != "" {
+		args = append(args, "-d", device)
+	}
+	args = append(args, "set", fmt.Sprintf("%d%%", pctInt))
 
-    if dryRun {
-        cmd := "brightnessctl " + shellJoin(args)
-        if useSudo {
-            cmd = "sudo " + cmd
-        }
-        fmt.Fprintln(os.Stderr, "DRY RUN:", cmd)
-        return nil
-    }
+	if dryRun {
+		cmd := "brightnessctl " + shellJoin(args)
+		if useSudo {
+			cmd = "sudo " + cmd
+		}
+		fmt.Fprintln(os.Stderr, "DRY RUN:", cmd)
+		return nil
+	}
 
-    // find brightnessctl
-    path, err := exec.LookPath("brightnessctl")
-    if err != nil {
-        return fmt.Errorf("brightnessctl not found in PATH; cannot apply brightness")
-    }
-    var cmd *exec.Cmd
-    if useSudo {
-        sudoPath, err := exec.LookPath("sudo")
-        if err != nil {
-            return fmt.Errorf("sudo not found in PATH; cannot run with sudo")
-        }
-        cmd = exec.Command(sudoPath, append([]string{path}, args...)...)
-    } else {
-        cmd = exec.Command(path, args...)
-    }
-    cmd.Stdout = os.Stderr
-    cmd.Stderr = os.Stderr
-    if err := cmd.Run(); err != nil {
-        return err
-    }
-    return nil
+	resolveOnce.Do(func() {
+		if p, err := exec.LookPath("brightnessctl"); err == nil {
+			resolvedBrightnessctlPath = p
+		}
+		if p, err := exec.LookPath("sudo"); err == nil {
+			resolvedSudoPath = p
+		}
+	})
+
+	if resolvedBrightnessctlPath == "" {
+		return fmt.Errorf("brightnessctl not found in PATH; cannot apply brightness")
+	}
+
+	var cmd *exec.Cmd
+	if useSudo {
+		if resolvedSudoPath == "" {
+			return fmt.Errorf("sudo not found in PATH; cannot run with sudo")
+		}
+		cmd = exec.Command(resolvedSudoPath, append([]string{resolvedBrightnessctlPath}, args...)...)
+	} else {
+		cmd = exec.Command(resolvedBrightnessctlPath, args...)
+	}
+
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return err
+	}
+	return nil
 }
 
 // maskKey masks API key for logging.
 func maskKey(k string) string {
-    if k == "" {
-        return "<none>"
-    }
-    if len(k) <= 8 {
-        return k
-    }
-    return k[:4] + "..." + k[len(k)-4:]
+	if k == "" {
+		return "<none>"
+	}
+	if len(k) <= 8 {
+		return k
+	}
+	return k[:4] + "..." + k[len(k)-4:]
 }
 
 // computeReport encapsulates analysis logic so it can be called repeatedly by daemon mode
-func computeReport(ctx context.Context, opts brightness.AnalyzeOptions, lat, lon float64, useOWM bool, envKey string, debug bool) (brightness.Report, error) {
-    var r brightness.Report
-    key := opts.OWMKey
-    if key == "" {
-        key = envKey
-    }
+// computeReport runs a single analysis pass. If owmClient is non-nil it will be used
+// (preserving its cache and connection pool); otherwise the function will fall back
+// to the local clear-sky model.
+func computeReport(ctx context.Context, opts brightness.AnalyzeOptions, lat, lon float64, useOWM bool, envKey string, debug bool, owmClient *brightness.OWMClient) (brightness.Report, error) {
+	var r brightness.Report
 
-    if useOWM {
-        if debug {
-            src := "env"
-            if opts.OWMKey != "" {
-                src = "flag"
-            }
-            fmt.Fprintln(os.Stderr, "OWM key source:", src)
-            fmt.Fprintln(os.Stderr, "OWM key:", maskKey(key))
+	// prefer explicit key in options, then environment key
+	key := opts.OWMKey
+	if key == "" {
+		key = envKey
+	}
 
-            client := brightness.NewOWMClient(key, opts.CacheTTL, opts.OWMTimeout)
-            owmCur, gerr := client.GetCurrent(ctx, lat, lon)
-            if gerr != nil {
-                // fall back to local model
-                return brightness.AnalyzeWithValues(opts.Time, opts.Location, opts.Orientation, opts.Device, opts.Environment, opts.LuminousEfficacy, 0, 0, 0)
-            }
+	if useOWM {
+		// ensure we have a reusable client so caching and keep-alive work across calls
+		client := owmClient
+		if client == nil {
+			if key == "" {
+				// no API key available; fall back to model
+				return brightness.AnalyzeWithValues(opts.Time, opts.Location, opts.Orientation, opts.Device, opts.Environment, opts.LuminousEfficacy, 0, 0, 0)
+			}
+			client = brightness.NewOWMClient(key, opts.CacheTTL, opts.OWMTimeout)
+		}
 
-            enc := json.NewEncoder(os.Stderr)
-            enc.SetIndent("", "  ")
-            enc.Encode(owmCur)
+		if debug {
+			src := "env"
+			if opts.OWMKey != "" {
+				src = "flag"
+			}
+			fmt.Fprintln(os.Stderr, "OWM key source:", src)
+			fmt.Fprintln(os.Stderr, "OWM key:", maskKey(key))
+		}
 
-            dni, dhi, ghi, err := brightness.ClearSkyIrradiance(opts.Time, opts.Location)
-            if err != nil {
-                return r, err
-            }
-            cloudFrac := float64(owmCur.Clouds) / 100.0
-            dni, dhi, ghi = brightness.ApplyCloudAttenuation(dni, dhi, ghi, cloudFrac)
+		// Fetch current weather (uses client's cache)
+		owmCur, err := client.GetCurrent(ctx, lat, lon)
+		if err != nil {
+			// if OWM fails, gracefully fallback to local model
+			return brightness.AnalyzeWithValues(opts.Time, opts.Location, opts.Orientation, opts.Device, opts.Environment, opts.LuminousEfficacy, 0, 0, 0)
+		}
 
-            r, err = brightness.AnalyzeWithValues(opts.Time, opts.Location, opts.Orientation, opts.Device, opts.Environment, opts.LuminousEfficacy, dni, dhi, ghi)
-            if err != nil {
-                return r, err
-            }
-            r.DataSource = "owm"
-            return r, nil
-        }
+		if debug {
+			enc := json.NewEncoder(os.Stderr)
+			enc.SetIndent("", "  ")
+			enc.Encode(owmCur)
+		}
 
-        // non-debug OWM path
-        r2, err := brightness.AnalyzeWithOWM(ctx, lat, lon, opts)
-        if err != nil {
-            // fallback to clear-sky model
-            return brightness.AnalyzeWithValues(opts.Time, opts.Location, opts.Orientation, opts.Device, opts.Environment, opts.LuminousEfficacy, 0, 0, 0)
-        }
-        return r2, nil
-    }
+		// choose analysis time: explicit option > API timestamp > now
+		t := opts.Time
+		if t.IsZero() {
+			if owmCur.Dt != 0 {
+				t = time.Unix(owmCur.Dt, 0)
+			} else {
+				t = time.Now()
+			}
+		}
 
-    // no OWM: local model
-    return brightness.AnalyzeWithValues(opts.Time, opts.Location, opts.Orientation, opts.Device, opts.Environment, opts.LuminousEfficacy, 0, 0, 0)
+		// synthesize irradiance from clear-sky then attenuate by cloud fraction
+		dni, dhi, ghi, err := brightness.ClearSkyIrradiance(t, brightness.Location{Lat: lat, Lon: lon, AltMeters: opts.Location.AltMeters})
+		if err != nil {
+			return r, err
+		}
+
+		const defaultCloud = 0.5
+		cloudFrac := float64(owmCur.Clouds) / 100.0
+		if opts.Environment.CloudFraction != 0 && opts.Environment.CloudFraction != defaultCloud {
+			cloudFrac = opts.Environment.CloudFraction
+		}
+		dni, dhi, ghi = brightness.ApplyCloudAttenuation(dni, dhi, ghi, cloudFrac)
+
+		r, err = brightness.AnalyzeWithValues(t, brightness.Location{Lat: lat, Lon: lon, AltMeters: opts.Location.AltMeters}, opts.Orientation, opts.Device, opts.Environment, opts.LuminousEfficacy, dni, dhi, ghi)
+		if err != nil {
+			return r, err
+		}
+		r.DataSource = "owm"
+		return r, nil
+	}
+
+	// no OWM: local model using clear-sky defaults
+	return brightness.AnalyzeWithValues(opts.Time, opts.Location, opts.Orientation, opts.Device, opts.Environment, opts.LuminousEfficacy, 0, 0, 0)
 }
 
 // daemonLoop runs the periodic daemon logic. It returns when a signal is received on stop.
 func daemonLoop(initialReport brightness.Report, compute func() (brightness.Report, error), display float64, interval time.Duration, smoothingAlpha float64, hysteresisPercent float64, minApplyInterval time.Duration, brightnessctlDevice string, useSudo bool, dryRun bool, stop <-chan os.Signal) {
-    lastApplied := 0
-    lastAppliedTime := time.Now().Add(-minApplyInterval - time.Second)
-    var smoothed float64 = float64(initialReport.RecommendedDisplayNits)
-    ticker := time.NewTicker(interval)
-    defer ticker.Stop()
-    for {
-        select {
-        case <-stop:
-            fmt.Fprintln(os.Stderr, "stopping daemon")
-            return
-        case <-ticker.C:
-            r, err := compute()
-            if err != nil {
-                fmt.Fprintln(os.Stderr, "compute error:", err)
-                continue
-            }
-            // apply exponential smoothing
-            smoothed = (smoothingAlpha)*r.RecommendedDisplayNits + (1-smoothingAlpha)*smoothed
-            // compute percent
-            pct := 100.0 * smoothed / display
-            if pct < 1.0 {
-                pct = 1.0
-            }
-            if pct > 100.0 {
-                pct = 100.0
-            }
-            pctInt := int(math.Round(pct))
-            // hysteresis: only apply if absolute percent change >= hysteresis
-            if math.Abs(float64(pctInt-lastApplied)) >= hysteresisPercent {
-                // respect minimum apply interval
-                if time.Since(lastAppliedTime) >= minApplyInterval {
-                    if err := runBrightness(pctInt, brightnessctlDevice, useSudo, dryRun); err != nil {
-                        fmt.Fprintln(os.Stderr, "apply error:", err)
-                    } else {
-                        fmt.Fprintln(os.Stderr, "applied brightness (daemon):", pctInt, "%")
-                        lastApplied = pctInt
-                        lastAppliedTime = time.Now()
-                    }
-                }
-            }
-        }
-    }
+	lastApplied := 0
+	lastAppliedTime := time.Now().Add(-minApplyInterval - time.Second)
+	var smoothed float64 = float64(initialReport.RecommendedDisplayNits)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			fmt.Fprintln(os.Stderr, "stopping daemon")
+			return
+		case <-ticker.C:
+			r, err := compute()
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "compute error:", err)
+				continue
+			}
+			// apply exponential smoothing
+			smoothed = (smoothingAlpha)*r.RecommendedDisplayNits + (1-smoothingAlpha)*smoothed
+			// compute percent
+			pct := 100.0 * smoothed / display
+			if pct < 1.0 {
+				pct = 1.0
+			}
+			if pct > 100.0 {
+				pct = 100.0
+			}
+			pctInt := int(math.Round(pct))
+			// hysteresis: only apply if absolute percent change >= hysteresis
+			if math.Abs(float64(pctInt-lastApplied)) >= hysteresisPercent {
+				// respect minimum apply interval
+				if time.Since(lastAppliedTime) >= minApplyInterval {
+					if err := runBrightness(pctInt, brightnessctlDevice, useSudo, dryRun); err != nil {
+						fmt.Fprintln(os.Stderr, "apply error:", err)
+					} else {
+						fmt.Fprintln(os.Stderr, "applied brightness (daemon):", pctInt, "%")
+						lastApplied = pctInt
+						lastAppliedTime = time.Now()
+					}
+				}
+			}
+		}
+	}
 }
 
 func main() {
@@ -264,15 +306,27 @@ func main() {
 		opts.OWMKey = *owmKey
 	}
 
-    // computeReport is wrapped above to make daemon testing easier
+	// computeReport is wrapped above to make daemon testing easier
 
-    // compute first report synchronously
-    var report brightness.Report
-    report, err = computeReport(context.Background(), opts, *lat, *lon, useOWM, envKey, *debug)
-    if err != nil {
-        fmt.Fprintln(os.Stderr, "error:", err)
-        os.Exit(1)
-    }
+	// compute first report synchronously
+	var report brightness.Report
+	// create a long-lived OWM client so that cache and keep-alive persist across daemon iterations
+	var owmClient *brightness.OWMClient
+	if useOWM {
+		key := opts.OWMKey
+		if key == "" {
+			key = envKey
+		}
+		if key != "" {
+			owmClient = brightness.NewOWMClient(key, opts.CacheTTL, opts.OWMTimeout)
+		}
+	}
+
+	report, err = computeReport(context.Background(), opts, *lat, *lon, useOWM, envKey, *debug, owmClient)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
 
 	switch *format {
 	case "text":
@@ -296,8 +350,8 @@ func main() {
 		fmt.Println("unsupported format")
 	}
 
-    // Optionally apply recommended brightness via brightnessctl
-    if *apply {
+	// Optionally apply recommended brightness via brightnessctl
+	if *apply {
 		// Recommended nits are in report.RecommendedDisplayNits. Map to percentage of device max (display-nits flag).
 		recommended := report.RecommendedDisplayNits
 		deviceMax := *display
@@ -324,22 +378,22 @@ func main() {
 		}
 		args = append(args, "set", fmt.Sprintf("%d%%", pctInt))
 
-        if err := runBrightness(pctInt, *brightnessctlDevice, *useSudo, *dryRun); err != nil {
-            fmt.Fprintln(os.Stderr, "Can't modify brightness:", err)
-            fmt.Fprintln(os.Stderr, "You should run this program with root privileges or grant write permissions to device files. See docs/udev-backlight.md for udev rule example.")
-            os.Exit(1)
-        }
-        fmt.Fprintln(os.Stderr, "applied brightness:", pctInt, "%")
-    }
+		if err := runBrightness(pctInt, *brightnessctlDevice, *useSudo, *dryRun); err != nil {
+			fmt.Fprintln(os.Stderr, "Can't modify brightness:", err)
+			fmt.Fprintln(os.Stderr, "You should run this program with root privileges or grant write permissions to device files. See docs/udev-backlight.md for udev rule example.")
+			os.Exit(1)
+		}
+		fmt.Fprintln(os.Stderr, "applied brightness:", pctInt, "%")
+	}
 
 	// If daemon mode requested, enter loop
-    if *daemon {
-        stop := make(chan os.Signal, 1)
-        signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	if *daemon {
+		stop := make(chan os.Signal, 1)
+		signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 
-        compute := func() (brightness.Report, error) {
-            return computeReport(context.Background(), opts, *lat, *lon, useOWM, envKey, *debug)
-        }
-        daemonLoop(report, compute, *display, *interval, *smoothingAlpha, *hysteresis, *minApplyInterval, *brightnessctlDevice, *useSudo, *dryRun, stop)
-    }
+		compute := func() (brightness.Report, error) {
+			return computeReport(context.Background(), opts, *lat, *lon, useOWM, envKey, *debug, owmClient)
+		}
+		daemonLoop(report, compute, *display, *interval, *smoothingAlpha, *hysteresis, *minApplyInterval, *brightnessctlDevice, *useSudo, *dryRun, stop)
+	}
 }
