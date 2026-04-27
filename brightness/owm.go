@@ -102,19 +102,19 @@ func (c *OWMClient) GetCurrent(ctx context.Context, lat, lon float64) (OWMCurren
 	u.RawQuery = q.Encode()
 
 	var lastErr error
-    for attempt := 0; attempt <= c.retries; attempt++ {
-        req, _ := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
-        resp, err := c.httpClient.Do(req)
-        if err != nil {
-            lastErr = err
-            // backoff
-            select {
-            case <-ctx.Done():
-                return OWMCurrent{}, ctx.Err()
-            case <-time.After(time.Duration(1<<attempt) * time.Second):
-            }
-            continue
-        }
+	for attempt := 0; attempt <= c.retries; attempt++ {
+		req, _ := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			lastErr = err
+			// backoff
+			select {
+			case <-ctx.Done():
+				return OWMCurrent{}, ctx.Err()
+			case <-time.After(time.Duration(1<<attempt) * time.Second):
+			}
+			continue
+		}
 
 		// read body
 		body, _ := io.ReadAll(resp.Body)
