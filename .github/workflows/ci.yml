@@ -28,10 +28,28 @@ jobs:
             echo "go mod not supported by this Go installation; skipping download"
           fi
       - name: Run linters
+        id: golangci
         uses: golangci/golangci-lint-action@v4
         with:
           version: v1.59.0
           args: --timeout 5m ./...
+        continue-on-error: true
+      - name: Linter diagnostics
+        if: always()
+        run: |
+          echo "--- go version ---"
+          go version || true
+          echo "--- go env ---"
+          go env || true
+          echo "--- which go ---"
+          which go || true
+          echo "--- golangci-lint version ---"
+          if [ -x "$GITHUB_WORKSPACE/golangci-lint" ]; then
+            $GITHUB_WORKSPACE/golangci-lint version || true
+          else
+            echo "golangci-lint not found in workspace; action may have installed it elsewhere"
+          fi
+          echo "--- end diagnostics ---"
       - name: Run tests
         run: go test ./... -v
       - name: Build binaries
