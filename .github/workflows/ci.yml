@@ -19,7 +19,14 @@ jobs:
         with:
           go-version: ${{ matrix.go-version }}
       - name: Install deps
-        run: go mod download
+        run: |
+          go version
+          # guard against Go installations that don't support 'go mod'
+          if go help mod >/dev/null 2>&1; then
+            go mod download
+          else
+            echo "go mod not supported by this Go installation; skipping download"
+          fi
       - name: Run linters
         uses: golangci/golangci-lint-action@v4
         with:
