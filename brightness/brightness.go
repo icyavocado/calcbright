@@ -18,9 +18,9 @@ type Orientation struct {
 }
 
 type DeviceSpec struct {
-    DisplayNits     float64
-    Reflectance     float64 // 0..1
-    AntiGlareFactor float64 // multiplier 0..1
+	DisplayNits     float64
+	Reflectance     float64 // 0..1
+	AntiGlareFactor float64 // multiplier 0..1
 }
 
 type Environment struct {
@@ -225,7 +225,7 @@ func ReflectedLuminance(E_lux, reflectance float64) float64 {
 }
 
 func PerceivedLuminance(displayNits, reflected float64) float64 {
-    return displayNits + reflected
+	return displayNits + reflected
 }
 
 // AnalyzeWithValues performs analysis given irradiance values (W/m^2) or falls back to ClearSky.
@@ -239,11 +239,30 @@ func AnalyzeWithValues(t time.Time, loc Location, orient Orientation, dev Device
 		}
 	}
 
-	sunAz, sunZen, _ := SunPosition(t, loc)
+	// Apply sensible defaults before calculations so they are used consistently.
+	if dev.DisplayNits <= 0 {
+		dev.DisplayNits = 300
+	}
+	if dev.Reflectance <= 0 {
+		dev.Reflectance = 0.05
+	}
+	if env.GroundAlbedo == 0 {
+		env.GroundAlbedo = 0.2
+	}
+	if luminousEfficacy <= 0 {
+		luminousEfficacy = 120
+	}
+
+	sunAz, sunZen, sunErr := SunPosition(t, loc)
+	if sunErr != nil {
+		return Report{}, sunErr
+	}
+
 	E_direct, E_diffuse, E_reflected, E_total := IlluminanceOnTilt(dni, dhi, ghi, sunAz, sunZen, orient.AzimuthDeg, orient.TiltDeg, env.GroundAlbedo, luminousEfficacy)
 
 	reflectedL := ReflectedLuminance(E_total, dev.Reflectance)
 	perceived := PerceivedLuminance(dev.DisplayNits, reflectedL)
+
 	contrast := 0.0
 	if reflectedL <= 0 {
 		contrast = math.Inf(1)
@@ -256,30 +275,22 @@ func AnalyzeWithValues(t time.Time, loc Location, orient Orientation, dev Device
 		glare = true
 	}
 
-    // tune defaults if unspecified
-    if dev.DisplayNits <= 0 {
-        dev.DisplayNits = 300
-    }
-    if dev.Reflectance <= 0 {
-        dev.Reflectance = 0.05
-    }
-
-    report := Report{
-        Time:                   t,
-        Location:               loc,
-        Orientation:            orient,
-        EDirect:                E_direct,
-        EDiffuse:               E_diffuse,
-        EReflected:             E_reflected,
-        ETotal:                 E_total,
-        ReflectedLuminance:     reflectedL,
-        PerceivedLuminance:     perceived,
-        ContrastRatio:          contrast,
-        RecommendedDisplayNits: perceived, // naive default: equal perceived
-        Glare:                  glare,
-        DataSource:             "model",
-    }
-    return report, nil
+	report := Report{
+		Time:                   t,
+		Location:               loc,
+		Orientation:            orient,
+		EDirect:                E_direct,
+		EDiffuse:               E_diffuse,
+		EReflected:             E_reflected,
+		ETotal:                 E_total,
+		ReflectedLuminance:     reflectedL,
+		PerceivedLuminance:     perceived,
+		ContrastRatio:          contrast,
+		RecommendedDisplayNits: perceived, // naive default: equal perceived
+		Glare:                  glare,
+		DataSource:             "model",
+	}
+	return report, nil
 }
 
 // Note: AnalyzeWithOWM implemented in owm.go
