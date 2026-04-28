@@ -114,6 +114,26 @@ func maskKey(k string) string {
 	return k[:4] + "..." + k[len(k)-4:]
 }
 
+// sanitizeReportForJSON replaces NaN/Inf floats with 0 so encoding/json doesn't fail.
+func sanitizeReportForJSON(r *brightness.Report) {
+	if r == nil {
+		return
+	}
+	fix := func(v *float64) {
+		if math.IsNaN(*v) || math.IsInf(*v, 0) {
+			*v = 0
+		}
+	}
+	fix(&r.EDirect)
+	fix(&r.EDiffuse)
+	fix(&r.EReflected)
+	fix(&r.ETotal)
+	fix(&r.ReflectedLuminance)
+	fix(&r.PerceivedLuminance)
+	fix(&r.ContrastRatio)
+	fix(&r.RecommendedDisplayNits)
+}
+
 // computeReport encapsulates analysis logic so it can be called repeatedly by daemon mode
 // computeReport runs a single analysis pass. If owmClient is non-nil it will be used
 // (preserving its cache and connection pool); otherwise the function will fall back
@@ -335,6 +355,8 @@ func main() {
 	case "json":
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
+		// sanitize before JSON encode to avoid +Inf/NaN errors
+		sanitizeReportForJSON(&report)
 		if err := enc.Encode(report); err != nil {
 			fmt.Fprintln(os.Stderr, "json encode error:", err)
 			os.Exit(1)
