@@ -131,8 +131,11 @@ func SunPosition(t time.Time, loc Location) (azimuthDeg, zenithDeg float64, err 
 	zenith := radToDeg(math.Acos(cosZenith))
 
 	// Azimuth
+	// The ATAN2 formula produces azimuth measured from south (0 = south,
+	// positive = west). Add 180° to convert to the clockwise-from-north
+	// convention documented on SunPosition's return values.
 	azRad := math.Atan2(math.Sin(Hrad), math.Cos(Hrad)*math.Sin(latRad)-math.Tan(decl)*math.Cos(latRad))
-	azDeg := math.Mod(radToDeg(azRad)+360.0, 360.0)
+	azDeg := math.Mod(radToDeg(azRad)+180.0, 360.0)
 
 	return azDeg, zenith, nil
 }

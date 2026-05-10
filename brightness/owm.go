@@ -68,11 +68,11 @@ func NewOWMClient(apiKey string, ttl time.Duration, timeout time.Duration) *OWMC
 }
 
 func (c *OWMClient) cacheKey(lat, lon float64) string {
-	// Round lat/lon to 4 decimals, time window by ttl
-	window := int64(c.ttl.Seconds())
-	now := time.Now().Unix()
-	slot := now / window
-	return fmt.Sprintf("%.4f:%.4f:%d", lat, lon, slot)
+	// Key by lat/lon only — expiry on the cached value controls the TTL.
+	// Previously this included a time-slot derived from the TTL, which caused
+	// a stampede at slot boundaries: the slot would roll over mid-TTL, making
+	// the cache miss even though valid data was present.
+	return fmt.Sprintf("%.4f:%.4f", lat, lon)
 }
 
 // GetCurrent fetches current weather from the Current Weather API, with caching and retries.
